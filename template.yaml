@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Idempotent serverless lead-capture ingest pattern: HTTP API -> Lambda ->
+  DynamoDB (leads) + SNS (fan-out notification), protected by a
+  client-supplied Idempotency-Key with a content-hash fallback and a
+  DynamoDB conditional write. See README.md and docs/ARCHITECTURE.md for the
+  idempotency design. Deployable in any region.
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: >
+      Email subscriber for the lead-notification SNS topic. Requires manual
+      confirmation after deploy (SNS email subscriptions cannot be
+      auto-confirmed by CloudFormation).
+
+  IdempotencyTtlHours:
+    Type: Number
+    Default: 24
+    Description: >
+      How many hours an idempotency record blocks a duplicate submission
+      before DynamoDB TTL expires it and the key becomes reusable.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 128
+    Timeout: 30
+    Architectures: [x86_64]
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # DynamoDB - leads + idempotency
+  # ---------------------------------------------------------------------------
+
+  LeadsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # Dedup table for the ingest Lambda's idempotency check (see
+  # src/ingest/idempotency.py and docs/ARCHITECTURE.md). TTL on `expires_at`
+  # auto-cleans records so the table never needs a manual purge job.
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: idempotency_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: idempotency_key
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
+  # ---------------------------------------------------------------------------
+  # SNS - fan-out notification
+  # ---------------------------------------------------------------------------
+
+  LeadsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Lead notifications
+
+  LeadsTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref LeadsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ---------------------------------------------------------------------------
+  # Ingest: HTTP API + Lambda
+  # ---------------------------------------------------------------------------
+
+  LeadApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: [POST, OPTIONS]
+        AllowHeaders: [content-type, idempotency-key]
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/ingest/
+      Handler: lambda_function.lambda_handler
+      Environment:
+        Variables:
+          LEADS_TABLE_NAME: !Ref LeadsTable
+          LEAD_TOPIC_ARN: !Ref LeadsTopic
+          IDEMPOTENCY_TABLE_NAME: !Ref IdempotencyTable
+          IDEMPOTENCY_TTL_HOURS: !Ref IdempotencyTtlHours
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref LeadsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IdempotencyTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt LeadsTopic.TopicName
+      Events:
+        LeadRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LeadApi
+            Path: /lead
+            Method: post
+
+  IngestFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${IngestFunction}
+      RetentionInDays: 90
+
+Outputs:
+  LeadApiEndpoint:
+    Description: Invoke URL for the lead-capture endpoint (POST /lead).
+    Value: !Sub https://${LeadApi}.execute-api.${AWS::Region}.amazonaws.com/lead
+  LeadsTableName:
+    Value: !Ref LeadsTable
+  IdempotencyTableName:
+    Value: !Ref IdempotencyTable
+  LeadsTopicArn:
+    Value: !Ref LeadsTopic

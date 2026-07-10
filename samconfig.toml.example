@@ -1,0 +1,17 @@
+# Copy this file to samconfig.toml and fill in your own values, or just run
+# `sam deploy --guided` and let it write samconfig.toml for you.
+#
+# samconfig.toml is gitignored on purpose: it's meant to be regenerated per
+# deployer/fork.
+
+version = 0.1
+
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "aws-serverless-lead-capture"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+parameter_overrides = "NotificationEmail=\"you@example.com\" IdempotencyTtlHours=\"24\""
