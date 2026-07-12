@@ -86,3 +86,10 @@ class IdempotencyStore:
             ExpressionAttributeNames={"#s": "status", "#r": "response"},
             ExpressionAttributeValues={":complete": STATUS_COMPLETE, ":response": response},
         )
+
+    def release(self, key: str) -> None:
+        """Delete a reservation that never reached complete(), so a retry can
+        acquire the key immediately instead of waiting out the TTL. Only safe
+        to call when none of the side effects the reservation was guarding
+        actually happened yet - see lambda_function.py for where this applies."""
+        self._table.delete_item(Key={"idempotency_key": key})

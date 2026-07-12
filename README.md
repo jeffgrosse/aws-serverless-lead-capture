@@ -157,7 +157,19 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-Expected: 14 tests passing.
+Expected: 24 tests passing.
+
+## Known follow-ups
+
+Tracked from an internal code review (2026-07-12), deferred to v0.2:
+
+- **`idempotency.py` `reserve()` round-trip**: a duplicate/retry request costs a conditional `PutItem`
+  (fails) then a separate `GetItem` to fetch the existing record. Passing
+  `ReturnValuesOnConditionCheckFailure='ALL_OLD'` to `put_item` would return the existing item directly
+  from the failed write, removing the extra round-trip on the retry path specifically.
+- **Duplicated `boto3` client construction**: `lambda_function.py` and `idempotency.py` each independently
+  construct their own `boto3.resource("dynamodb")`. A shared construction point would remove the
+  duplication without changing behavior.
 
 ## Extending
 

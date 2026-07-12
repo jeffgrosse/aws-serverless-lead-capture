@@ -9,17 +9,24 @@ import boto3
 from idempotency import IdempotencyStore, resolve_key
 from scorer import score_lead
 
-CORS_HEADERS = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type, Idempotency-Key",
-}
-
 dynamodb = boto3.resource("dynamodb")
 sns = boto3.client("sns")
 idempotency = IdempotencyStore(
     table_name=os.environ["IDEMPOTENCY_TABLE_NAME"],
     ttl_hours=float(os.environ.get("IDEMPOTENCY_TTL_HOURS", "24")),
 )
+
+_STRING_FIELDS = ("name", "email", "company", "phone", "service", "note")
+
+
+def _validate_body(body) -> str:
+    """Returns an error message if `body` isn't a usable request shape, else ""."""
+    if not isinstance(body, dict):
+        return "request body must be a JSON object"
+    for field in _STRING_FIELDS:
+        if field in body and body[field] is not None and not isinstance(body[field], str):
+            return f"'{field}' must be a string"
+    return ""
 
 
 def _json_default(obj):
@@ -31,9 +38,14 @@ def _json_default(obj):
 
 
 def _respond(status_code: int, payload: dict) -> dict:
+    # No CORS headers here on purpose - template.yaml's HttpApi
+    # CorsConfiguration is the single source of truth (AWS HTTP APIs apply
+    # configured CORS headers to every response automatically, not just
+    # preflight OPTIONS). Duplicating them here risked drifting out of sync,
+    # e.g. if AllowOrigins is restricted for production per the README but
+    # this dict is left at "*".
     return {
         "statusCode": status_code,
-        "headers": CORS_HEADERS,
         "body": json.dumps(payload, default=_json_default),
     }
 
@@ -44,6 +56,13 @@ def lambda_handler(event, context):
         body = json.loads(raw_body)
     except (TypeError, ValueError):
         body = {}
+
+    # Validate BEFORE reserving an idempotency key - a malformed body must
+    # never reserve a key it then can't complete, which would strand that
+    # key IN_PROGRESS for the full TTL with no way to retry cleanly.
+    validation_error = _validate_body(body)
+    if validation_error:
+        return _respond(400, {"message": validation_error})
 
     key = resolve_key(event.get("headers", {}), raw_body)
 
@@ -66,8 +85,21 @@ def lambda_handler(event, context):
     company = body.get("company", "")
     phone = body.get("phone", "")
     service = body.get("service", "")
-    note = body.get("note", "")
-    scoring = score_lead({**body, "message": note})
+    # "message" is accepted as an alias for "note" - scorer.py's own
+    # score_lead() docstring documents the field as "message", but this
+    # API's real, stored/notified field is "note". A caller who followed the
+    # scorer docstring instead of the README used to have that content
+    # silently discarded everywhere (storage, SNS text, and scoring) by
+    # `{**body, "message": note}`, which always overwrote "message" with the
+    # (usually empty) "note" default.
+    note = body.get("note") or body.get("message") or ""
+    scoring = score_lead({
+        "email": email,
+        "company": company,
+        "phone": phone,
+        "service": service,
+        "message": note,
+    })
 
     try:
         table = dynamodb.Table(os.environ["LEADS_TABLE_NAME"])
@@ -85,7 +117,15 @@ def lambda_handler(event, context):
             "factors": scoring["factors"],
         })
     except Exception as e:
+        # Nothing was written, so it's safe to release the key - a retry can
+        # attempt the whole flow again with no risk of a duplicate lead. Must
+        # NOT fall through to complete(): that would permanently cache this
+        # failure as a fake "Success" for every future retry (see
+        # docs/ARCHITECTURE.md - the idempotency table exists specifically to
+        # avoid caching side effects that never actually happened).
         print("DynamoDB error:", str(e))
+        idempotency.release(key)
+        return _respond(502, {"message": "Failed to record lead - please retry"})
 
     try:
         sns.publish(
@@ -103,8 +143,26 @@ def lambda_handler(event, context):
             ),
         )
     except Exception as e:
+        # The lead is already in LeadsTable, so this must NOT release() the
+        # key - a retry would re-run put_item with a fresh uuid and create a
+        # duplicate lead record, which is worse than a missed notification.
+        # Also must NOT call complete(): this attempt didn't fully succeed,
+        # so it shouldn't be cached as one. The key is left IN_PROGRESS,
+        # which is the same documented crash-mid-processing tradeoff
+        # docs/ARCHITECTURE.md already calls out - a retry within the TTL
+        # gets an ack without reprocessing, a retry after TTL gets a fresh
+        # attempt (which will re-send the notification).
         print("SNS error:", str(e))
+        return _respond(502, {"message": "Lead recorded, but the notification failed"})
 
     response_payload = {"message": "Success", "score": scoring["score"], "tier": scoring["tier"]}
-    idempotency.complete(key, response_payload)
+    try:
+        idempotency.complete(key, response_payload)
+    except Exception as e:
+        # The write and the publish both already succeeded - don't let a
+        # failure in bookkeeping the response mask that real success. Worst
+        # case the key stays IN_PROGRESS until TTL (same documented tradeoff
+        # as above), but the caller who actually did everything right still
+        # gets told so.
+        print("Idempotency complete() error:", str(e))
     return _respond(200, response_payload)

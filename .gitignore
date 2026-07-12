@@ -34,3 +34,6 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Per-machine code review scaffolding — not public engineering artifact
+.human/

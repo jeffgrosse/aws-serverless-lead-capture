@@ -75,6 +75,17 @@ def test_reserve_distinct_keys_both_acquire(idempotency_table):
     assert store.reserve("key-b").acquired is True
 
 
+def test_release_deletes_the_reservation(idempotency_table):
+    store = IdempotencyStore(table_name=idempotency_table.name, ttl_hours=24)
+    store.reserve("releasable-key")
+
+    store.release("releasable-key")
+
+    # Released, not just marked something - a fresh reserve() must acquire
+    # again rather than seeing a stale IN_PROGRESS/COMPLETE record.
+    assert store.reserve("releasable-key") == Reservation(acquired=True)
+
+
 def test_complete_regression_response_is_dynamodb_reserved_word(idempotency_table):
     """
     Regression test for a bug found while validating this module with moto:

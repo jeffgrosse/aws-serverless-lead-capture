@@ -38,6 +38,13 @@ DATA_SIGNAL_KEYWORDS = {
     "budget", "timeline", "team", "integration", "migrate", "scale",
     "users", "customers", "data", "api",
 }
+# Word-boundary match, not substring - a naive `kw in text` check let short
+# keywords like "api" false-positive inside unrelated words ("rapidly",
+# "capital"). (Note: this also means a plural like "apis" no longer matches
+# "api" - a deliberate tightening, since the found bug was over-matching.)
+_DATA_SIGNAL_PATTERN = re.compile(
+    r"\b(?:" + "|".join(re.escape(kw) for kw in DATA_SIGNAL_KEYWORDS) + r")\b"
+)
 
 
 def _tier(score: int) -> str:
@@ -61,6 +68,8 @@ def _score_email(email: str) -> tuple[int, str]:
     if not email or "@" not in email:
         return 0, "email: missing or malformed"
     domain = email.split("@", 1)[1].strip().lower()
+    if not domain:
+        return 0, "email: missing or malformed"
     if domain in DISPOSABLE_EMAIL_DOMAINS:
         return -10, f"email: disposable domain {domain} (-10)"
     if domain in FREE_EMAIL_DOMAINS:
@@ -90,7 +99,7 @@ def _score_message(message: str) -> tuple[int, List[str]]:
         points += 4
         notes.append(f"detailed message ({len(msg)} chars, +4)")
     lower = msg.lower()
-    if any(kw in lower for kw in DATA_SIGNAL_KEYWORDS):
+    if _DATA_SIGNAL_PATTERN.search(lower):
         points += 3
         notes.append("data-signal keyword in message (+3)")
     if re.search(r"\d", msg):
